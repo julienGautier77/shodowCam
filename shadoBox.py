@@ -623,6 +623,9 @@ class ThreadRunAcq(QtCore.QThread):
                 break
             if not self.cam.IsAcquisitionRunning():
                 self.cam.Acquisition(N=1, timeout=120000)
+                # Vérifier stop APRES acquisition (important en mode trigger)
+                if self.stopRunAcq:
+                    break
                 print('-----> Acquisition')
                 try:
                     data = self.cam.GetAcquiredData()

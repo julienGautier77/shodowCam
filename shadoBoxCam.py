@@ -24,7 +24,7 @@ EXPOSURE_MAX_MS  = 9000.0
 READOUT_MARGIN_S = 0.005
 
 TEMP_TIFF = os.path.join(tempfile.gettempdir(), "shadobox_frame.tiff")
-TRIGGER_SLICE_MS = 500  # tranche pour boucle interruptible mode trigger
+TRIGGER_SLICE_MS = 5000  # tranche pour boucle interruptible mode trigger (5s)
 
 lock = threading.Lock()
 
@@ -34,7 +34,7 @@ class Camera:
         self._dll_path     = dll_path or DEFAULT_DLL_PATH
         self._dll          = None
         self._connected    = False
-        self._server_idx   = 1
+        self._server_idx   = -1   # -1 = auto-detect
         self._res_idx      = 0
         self._last_frame   = None
         self._acquiring    = False
@@ -68,6 +68,8 @@ class Camera:
         d.CaptureImageTiffSlice.argtypes = [ctypes.c_char_p, ctypes.c_int]
         d.CaptureImageTiffSlice.restype  = ctypes.c_int
         d.AbortAcquisition.restype    = None
+        d.SendSoftwareTrigger.argtypes = []
+        d.SendSoftwareTrigger.restype  = ctypes.c_int
         d.SetFeatureFloat.argtypes    = [ctypes.c_char_p, ctypes.c_double]
         d.SetFeatureFloat.restype     = ctypes.c_int
         d.GetFeatureFloat.argtypes    = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_double)]
@@ -130,13 +132,54 @@ class Camera:
     def getAvailableCameras(self):
         return self._dll.ListCameras()
 
+    def _findShadoBoxServer(self):
+        """
+        Trouve automatiquement l'index serveur du Shad-o-Box
+        en cherchant 'ShadoBox' ou 'Shado' dans le nom du serveur.
+        Utilise GetServerName via la DLL.
+        """
+        import ctypes as ct
+
+        # Ajouter GetServerName si pas déjà fait
+        try:
+            self._dll.GetServerName.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+            self._dll.GetServerName.restype  = ctypes.c_int
+        except Exception:
+            pass
+
+        # Compter les serveurs
+        try:
+            sc = self._dll.GetCameraCount()
+        except Exception:
+            sc = 20
+
+        # Chercher via GetServerName dans la DLL
+        for srv in range(30):
+            try:
+                buf = ctypes.create_string_buffer(256)
+                ok = self._dll.GetServerName(srv, buf, len(buf))
+                if ok:
+                    name = buf.value.decode().lower()
+                    if "shado" in name:
+                        print(f"Shad-o-Box trouvé sur serveur {srv} : {buf.value.decode()}")
+                        return srv
+            except Exception:
+                break
+        return -1
+
     def OpenCamerabySerial(self, serial=None):
+        # Auto-détection du serveur Shad-o-Box si index non fixé
+        if self._server_idx == -1:
+            self._server_idx = self._findShadoBoxServer()
+            if self._server_idx == -1:
+                raise RuntimeError("Shad-o-Box non trouvé. Vérifiez le câble GigE.")
+
         if not self._dll.InitializeCamera(self._server_idx, self._res_idx):
             raise RuntimeError("Impossible de connecter le Shad-o-Box.")
         self._connected = True
-        # Laisser le temps à la caméra de s'initialiser (court délai)
+        # Délai plus long pour laisser le pilote GigE se stabiliser
         try:
-            time.sleep(0.2)
+            time.sleep(1.0)
         except KeyboardInterrupt:
             pass
 
@@ -286,23 +329,37 @@ class Camera:
                     if ok == 1:
                         self._last_frame = tifffile.imread(TEMP_TIFF).astype(np.uint16)
                 else:
-                    # ExtTrigger : boucle interruptible
-                    print("Attente trigger externe...")
-                    total = 0
-                    while total < timeout:
+                    # ExtTrigger : timeout fixe de 5 minutes
+                    # (indépendant du FrameRate qui peut être erroné en mode trigger)
+                    wait_ms = 300000  # 5 minutes
+                    self._dll.SetTimeout(wait_ms)
+                    print(f"Attente trigger externe (timeout={wait_ms//1000}s)...")
+
+                    import threading as _th
+                    result = [0]
+
+                    def _snap():
+                        result[0] = self._dll.CaptureImageTiff(TEMP_TIFF.encode())
+
+                    t_snap = _th.Thread(target=_snap, daemon=True)
+                    t_snap.start()
+
+                    # Attendre en vérifiant _stop_acq toutes les 200ms
+                    while t_snap.is_alive():
                         if self._stop_acq:
+                            self._dll.AbortAcquisition()
+                            t_snap.join(5.0)  # attendre jusqu'à 5s
                             print("Acquisition interrompue")
                             break
-                        res = self._dll.CaptureImageTiffSlice(TEMP_TIFF.encode(), TRIGGER_SLICE_MS)
-                        if res == 1:
-                            self._last_frame = tifffile.imread(TEMP_TIFF).astype(np.uint16)
-                            print("Trigger reçu !")
-                            break
-                        elif res == -1:
-                            total += TRIGGER_SLICE_MS
-                        else:
-                            print("CaptureImageTiffSlice : erreur")
-                            break
+                        time.sleep(0.2)
+
+                    # Si le thread est encore vivant après abort, on attend quand même
+                    if t_snap.is_alive():
+                        t_snap.join(3.0)
+
+                    if result[0] == 1 and not self._stop_acq:
+                        self._last_frame = tifffile.imread(TEMP_TIFF).astype(np.uint16)
+                        print("Trigger reçu !")
             except Exception as e:
                 print(f"Acquisition : {e}")
             finally:
@@ -318,8 +375,13 @@ class Camera:
     def StopAcquisition(self):
         self._stop_acq = True
         self._acquiring = False
-        try: self._dll.AbortAcquisition()
-        except Exception: pass
+        try:
+            if self._trigger_mode == 1:
+                # Soft trigger pour débloquer immédiatement le Wait()
+                self._dll.SendSoftwareTrigger()
+            self._dll.AbortAcquisition()
+        except Exception:
+            pass
 
     def GetAcquiredData(self):
         if self._last_frame is None:

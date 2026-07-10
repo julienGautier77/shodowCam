@@ -28,12 +28,14 @@ extern "C" {
     __declspec(dllexport) int  ListCameras         ();
     __declspec(dllexport) int  GetCameraCount      ();
     __declspec(dllexport) int  GetImageSize        (int* width, int* height);
+    __declspec(dllexport) int  GetServerName       (int serverIndex, char* outBuf, int bufLen);
 
     __declspec(dllexport) int  CaptureImage        (const char* filename);
     __declspec(dllexport) int  CaptureImageTiff    (const char* filename);
     // Timeout court interruptible : 1=OK, -1=timeout partiel, 0=erreur
     __declspec(dllexport) int  CaptureImageTiffSlice(const char* filename, int sliceMs);
     __declspec(dllexport) void AbortAcquisition    ();
+    __declspec(dllexport) int  SendSoftwareTrigger ();
 
     __declspec(dllexport) int  SetFeatureFloat     (const char* name, double value);
     __declspec(dllexport) int  GetFeatureFloat     (const char* name, double* value);
@@ -171,6 +173,13 @@ int GetImageSize(int* w, int* h)
     return 1;
 }
 
+int GetServerName(int serverIndex, char* outBuf, int bufLen)
+{
+    try {
+        return SapManager::GetServerName(serverIndex, outBuf, bufLen) ? 1 : 0;
+    } catch (...) { return 0; }
+}
+
 // ── Acquisition ───────────────────────────────────────────────────────────────
 
 int CaptureImage(const char* filename)
@@ -223,6 +232,18 @@ void AbortAcquisition()
         // NE PAS appeler Abort() - cause des BSOD avec le pilote Sapera
         printf("Acquisition stoppée proprement\n");
     } catch (...) {}
+}
+
+// Envoie un software trigger pour débloquer un Wait() en mode ExtTrigger
+// Permet au Stop de répondre immédiatement sans attendre un vrai trigger
+int SendSoftwareTrigger()
+{
+    if (!_chk()) return 0;
+    try {
+        // SoftwareTrigger est une commande Execute sur le Shad-o-Box
+        INT64 val = 1;
+        return g_pAcqDevice->SetFeatureValue("SoftwareTrigger", val) ? 1 : 0;
+    } catch (...) { return 0; }
 }
 
 // ── GenICam ───────────────────────────────────────────────────────────────────
